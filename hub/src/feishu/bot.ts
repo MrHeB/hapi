@@ -102,6 +102,9 @@ export class FeishuBot implements NotificationChannel {
     // Pending permission requests for text-based interaction
     private pendingPermissionRequests: Map<string, { sessionId: string; requestId: string; tool: string }> = new Map()
 
+    // Sticky selected session per Feishu user
+    private currentSessionByOpenId: Map<string, string> = new Map()
+
     constructor(config: FeishuBotConfig) {
         this.config = config
         this.store = config.store
@@ -344,12 +347,12 @@ export class FeishuBot implements NotificationChannel {
     /**
      * Parse command from message text
      */
-    private parseCommand(text: string): { command: string; args: string[] } {
+    private parseCommand(text: string): { command: string; args: string[]; raw: string } {
         const trimmed = text.trim()
         const parts = trimmed.split(/\s+/)
         const command = parts[0].toLowerCase().replace(/^\//, '')
         const args = parts.slice(1)
-        return { command, args }
+        return { command, args, raw: trimmed }
     }
 
     /**
@@ -357,7 +360,7 @@ export class FeishuBot implements NotificationChannel {
      */
     private async handleCommand(
         openId: string,
-        command: { command: string; args: string[] },
+        command: { command: string; args: string[]; raw: string },
         messageId: string
     ): Promise<void> {
         switch (command.command) {
@@ -379,13 +382,17 @@ export class FeishuBot implements NotificationChannel {
             case 'reject':
                 await this.handleAllowDeny(openId, command.args, messageId, false)
                 break
+            case 'cmds':
+            case 'commands':
+                await this.handleListCommands(openId, messageId)
+                break
             case 'help':
             case 'start':
                 await this.handleHelp(openId)
                 break
             default:
-                // If not a command, treat as message to active session
-                await this.handleDirectMessage(openId, command.command + ' ' + command.args.join(' '), messageId)
+                // Preserve raw text (including leading /) when passing to Claude
+                await this.handleDirectMessage(openId, command.raw, messageId)
         }
     }
 
@@ -453,7 +460,9 @@ export class FeishuBot implements NotificationChannel {
         for (const session of activeSessions) {
             const sessionName = session.metadata?.name || session.id.slice(0, 8)
             const agentName = session.metadata?.flavor || 'Agent'
-            text += `• **${sessionName}** (${agentName})\n  ID: ${session.id.slice(0, 8)}...\n\n`
+            const sessionPath = session.metadata?.path || '-'
+            const sessionSummary = session.metadata?.summary?.text || '-'
+            text += `• **${sessionName}** (${agentName})\n  ID: ${session.id}\n  Path: ${sessionPath}\n  Recent: ${sessionSummary}\n\n`
         }
 
         await this.sendTextMessage(openId, text)
@@ -472,6 +481,28 @@ export class FeishuBot implements NotificationChannel {
         const messageText = args.slice(1).join(' ')
 
         await this.sendMessageToSession(openId, sessionId, messageText, messageId)
+    }
+
+    /**
+     * Find session by full id or prefix within namespace
+     */
+    private findSessionForNamespace(namespace: string, sessionIdOrPrefix: string): Session | null {
+        if (!this.syncEngine) {
+            return null
+        }
+
+        const sessions = this.syncEngine.getSessionsByNamespace(namespace)
+        const exact = sessions.find((s: Session) => s.id === sessionIdOrPrefix)
+        if (exact) {
+            return exact
+        }
+
+        const matched = sessions.filter((s: Session) => s.id.startsWith(sessionIdOrPrefix))
+        if (matched.length === 1) {
+            return matched[0] ?? null
+        }
+
+        return null
     }
 
     /**
@@ -496,13 +527,6 @@ export class FeishuBot implements NotificationChannel {
         const sessions = this.syncEngine.getSessionsByNamespace(namespace)
         console.log(`[FeishuBot] Found ${sessions.length} sessions in namespace ${namespace}`)
 
-        // Debug: list all sessions and their namespaces
-        const allSessions = this.syncEngine.getSessions()
-        console.log(`[FeishuBot] All sessions: ${allSessions.length}`)
-        for (const s of allSessions) {
-            console.log(`  - ${s.id}: namespace=${s.namespace}, active=${s.active}`)
-        }
-
         const activeSessions = sessions.filter((s: Session) => s.active)
         console.log(`[FeishuBot] Found ${activeSessions.length} active sessions`)
 
@@ -511,13 +535,25 @@ export class FeishuBot implements NotificationChannel {
             return
         }
 
-        // Use the most recently updated session
-        const session = activeSessions.sort(
-            (a: Session, b: Session) => (b.updatedAt || 0) - (a.updatedAt || 0)
-        )[0]
+        const currentSessionId = this.currentSessionByOpenId.get(openId)
+        if (currentSessionId) {
+            const currentSession = activeSessions.find((s: Session) => s.id === currentSessionId)
+            if (currentSession) {
+                console.log(`[FeishuBot] Reusing sticky session: ${currentSession.id}`)
+                await this.sendMessageToSession(openId, currentSession.id, text.trim(), messageId)
+                return
+            }
+        }
 
-        console.log(`[FeishuBot] Using session: ${session.id}`)
-        await this.sendMessageToSession(openId, session.id, text.trim(), messageId)
+        if (activeSessions.length === 1) {
+            const session = activeSessions[0]
+            this.currentSessionByOpenId.set(openId, session.id)
+            console.log(`[FeishuBot] Auto-selecting only active session: ${session.id}`)
+            await this.sendMessageToSession(openId, session.id, text.trim(), messageId)
+            return
+        }
+
+        await this.replyToMessage(messageId, 'Multiple active sessions found. Use /sessions to view them, then /send <session_id> <message> once to choose a session. After that, later messages will continue using that same session automatically.')
     }
 
     /**
@@ -540,8 +576,8 @@ export class FeishuBot implements NotificationChannel {
             return
         }
 
-        const session = this.syncEngine.getSession(sessionId)
-        if (!session || session.namespace !== namespace) {
+        const session = this.findSessionForNamespace(namespace, sessionId)
+        if (!session) {
             await this.replyToMessage(replyToMessageId, 'Session not found or access denied')
             return
         }
@@ -552,13 +588,16 @@ export class FeishuBot implements NotificationChannel {
         }
 
         try {
+            // Remember selected session for subsequent direct messages
+            this.currentSessionByOpenId.set(openId, session.id)
+
             // Send message via syncEngine to CLI
-            await this.syncEngine.sendMessage(sessionId, {
+            await this.syncEngine.sendMessage(session.id, {
                 text,
                 sentFrom: 'feishu'  // Use feishu type for external messages
             })
-            console.log(`[FeishuBot] Message sent to session ${sessionId}: ${text}`)
-            await this.replyToMessage(replyToMessageId, `✅ Message sent to session`)
+            console.log(`[FeishuBot] Message sent to session ${session.id}: ${text}`)
+            await this.replyToMessage(replyToMessageId, `✅ Message sent to session\nPath: ${session.metadata?.path || '-'}`)
         } catch (error) {
             console.error(`[FeishuBot] Failed to send message to session ${sessionId}:`, error)
             await this.replyToMessage(replyToMessageId, '❌ Failed to send message')
@@ -575,12 +614,63 @@ export class FeishuBot implements NotificationChannel {
 
 • **/bind <token>** - Bind your Feishu account to a namespace
 • **/sessions** - List all active sessions
-• **/send <session_id> <message>** - Send a message to an agent
+• **/cmds** - List slash commands for the current active session
+• **/send <session_id> <message>** - Send a message to an agent and set it as the current session
 • **/allow <request_id>** - Approve a permission request
 • **/deny <request_id>** - Deny a permission request
 • **/help** - Show this help message
-• **Direct message** - Send to the active session (if bound)`
+• **Direct message** - Reuse the previously selected session automatically
+
+**Special pass-through commands:**
+• **/compact** - Pass through to Claude
+• **/clear** - Pass through to Claude`
         await this.sendTextMessage(openId, text)
+    }
+
+    /**
+     * Handle /cmds command
+     */
+    private async handleListCommands(openId: string, messageId: string): Promise<void> {
+        const namespace = this.getNamespaceForOpenId(openId)
+        if (!namespace) {
+            await this.replyToMessage(messageId, 'Not bound. Use /bind <token> first.')
+            return
+        }
+
+        if (!this.syncEngine) {
+            await this.replyToMessage(messageId, 'HAPI is not ready')
+            return
+        }
+
+        const sessions = this.syncEngine.getSessionsByNamespace(namespace)
+        const activeSessions = sessions.filter((s: Session) => s.active)
+        if (activeSessions.length === 0) {
+            await this.replyToMessage(messageId, 'No active sessions. Start a session in HAPI first.')
+            return
+        }
+
+        const session = activeSessions.sort(
+            (a: Session, b: Session) => (b.updatedAt || 0) - (a.updatedAt || 0)
+        )[0]
+
+        try {
+            const agent = session.metadata?.flavor ?? 'claude'
+            const result = await this.syncEngine.listSlashCommands(session.id, agent)
+            if (!result.success || !result.commands || result.commands.length === 0) {
+                await this.replyToMessage(messageId, 'No slash commands found for the current session.')
+                return
+            }
+
+            const commandLines = result.commands
+                .map((cmd) => `• /${cmd.name}${cmd.description ? ` — ${cmd.description}` : ''}`)
+                .join('\n')
+
+            const text = `⚡ **Slash Commands**\n\nSession: ${session.metadata?.name || session.id.slice(0, 8)}\nPath: ${session.metadata?.path || '-'}\n\n${commandLines}`
+            await this.replyToMessage(messageId, text)
+        } catch (error) {
+            console.error('[FeishuBot] Failed to list slash commands:', error)
+            await this.replyToMessage(messageId, 'Failed to list slash commands')
+        }
     }
 
     /**
@@ -753,7 +843,8 @@ export class FeishuBot implements NotificationChannel {
 
         const sessionName = session.metadata?.name || session.id.slice(0, 8)
         const agentName = session.metadata?.flavor || 'Agent'
-        const text = `✅ **${agentName}** is ready\n\nSession: ${sessionName}\n\nThe agent is waiting for your next command.`
+        const sessionPath = session.metadata?.path || '-'
+        const text = `✅ **${agentName}** is ready\n\nSession: ${sessionName}\nPath: ${sessionPath}\n\nThe agent is waiting for your next command.`
 
         for (const openId of openIds) {
             try {
@@ -795,6 +886,7 @@ export class FeishuBot implements NotificationChannel {
 
         const sessionName = session.metadata?.name || session.id.slice(0, 8)
         const agentName = session.metadata?.flavor || 'Agent'
+        const sessionPath = session.metadata?.path || '-'
         const tool = request.tool || 'unknown'
         const args = request.arguments || {}
 
@@ -828,7 +920,7 @@ export class FeishuBot implements NotificationChannel {
             }
         }
 
-        const text = `🔔 **Permission Request - ${agentName}**\n\nSession: ${sessionName}\n\n${toolInfo}\n\nTo approve, reply: /allow ${requestId.slice(0, 8)}\nTo deny, reply: /deny ${requestId.slice(0, 8)}`
+        const text = `🔔 **Permission Request - ${agentName}**\n\nSession: ${sessionName}\nPath: ${sessionPath}\n\n${toolInfo}\n\nTo approve, reply: /allow ${requestId.slice(0, 8)}\nTo deny, reply: /deny ${requestId.slice(0, 8)}`
 
         for (const openId of openIds) {
             try {
@@ -862,11 +954,12 @@ export class FeishuBot implements NotificationChannel {
         const displayText = text.length > maxLength ? text.slice(0, maxLength) + '...' : text
 
         const agentName = session.metadata?.flavor ? session.metadata.flavor.charAt(0).toUpperCase() + session.metadata.flavor.slice(1) : 'Agent'
+        const sessionPath = session.metadata?.path || '-'
 
         for (const openId of openIds) {
             try {
                 console.log(`[FeishuBot] Sending message to openId=${openId}`)
-                await this.sendTextMessage(openId, `🤖 **${agentName}**\n\n${displayText}`)
+                await this.sendTextMessage(openId, `🤖 **${agentName}**\nPath: ${sessionPath}\n\n${displayText}`)
             } catch (error) {
                 console.error(`[FeishuBot] Failed to send message to ${openId}:`, error)
             }
